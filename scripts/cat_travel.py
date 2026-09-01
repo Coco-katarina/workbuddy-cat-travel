@@ -96,7 +96,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def _find_node():
     import shutil
-    return shutil.which("node")
+    n = shutil.which("node")
+    if n:
+        return n
+    # WorkBuddy 桌面端自带托管 Node（用户未单独安装 Node / 未加入 PATH 时自动复用）
+    base = os.path.join(os.path.expanduser("~"), ".workbuddy", "binaries", "node", "versions")
+    if os.path.isdir(base):
+        exe = "node.exe" if os.name == "nt" else "node"
+        # 版本目录可能带 -2 等后缀，按版本名倒序取最新可用的
+        for ver in sorted(os.listdir(base), reverse=True):
+            cand = os.path.join(base, ver, exe)
+            if os.path.isfile(cand):
+                return cand
+    return None
 
 
 def _find_decrypt_js():
@@ -182,6 +194,80 @@ def extract_token():
     if ent:
         os.environ["WB_ENT_ID"] = ent
     log("登录态提取成功（uid=%s）" % uid)
+
+
+# ============================================================
+# 成长计划开通状态探测 + 小白引导
+# ============================================================
+def is_growth_opened():
+    """探测当前账号是否已开通「成长计划」（猫猫旅行依赖它）。
+    返回 True=已开通，False=未开通 / 无法确认。
+    判定强信号：status 接口返回 code=0 且 data 含成长计划字段
+    （state 枚举 / daily_limit_reached / reward_credit）。
+    401/403 或业务码非 0 → 视为未就绪（需登录或开通）。
+    """
+    try:
+        code, text = api_call(CONFIG["status_path"], CONFIG["status_method"], None)
+    except Exception as e:
+        log("[探测成长计划] 状态接口异常：%s" % e)
+        return False
+    try:
+        resp = json.loads(text)
+    except Exception:
+        return False
+    if not isinstance(resp, dict):
+        return False
+    biz = resp.get("code")
+    if biz not in (0, None):
+        msg = str(resp.get("msg", "")).lower()
+        if any(k in msg for k in ("未开通", "未参与", "未加入", "not open",
+                                  "not joined", "forbidden", "no permission", "无权", "请先开通")):
+            return False
+        # 其他业务错误保守视为未就绪，交由开通引导兜底
+        return False
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return False
+    if data.get("state") in ("traveling", "arrived", "idle") \
+            or "daily_limit_reached" in data or "reward_credit" in data:
+        return True
+    return False
+
+
+def ensure_growth_opened():
+    """小白引导：未开通成长计划时，自动打开系统默认浏览器到开通页并提示。
+    返回 True=已开通；False=未开通（已引导，调用方应退出）。
+    开通页 URL：环境变量 CAT_TRAVEL_GROWTH_URL 优先，默认 {api_base}/activity/growth。
+    """
+    if is_growth_opened():
+        return True
+    url = (os.environ.get("CAT_TRAVEL_GROWTH_URL")
+           or (CONFIG["api_base"] + "/activity/growth"))
+    log("=" * 56)
+    log("⚠️  当前账号尚未开通「成长计划」，猫猫旅行的派发与领积分都依赖它。")
+    log("")
+    log("    正在自动打开浏览器到开通页面，请按页面提示完成开通——")
+    log("    通常只需点击一次「开通 / 加入」即可，无需任何复杂操作。")
+    log("")
+    log("    开通完成后，重新运行本脚本即可自动派发旅行 + 领取积分。")
+    log("")
+    log("    开通页面：%s" % url)
+    log("=" * 56)
+    try:
+        import webbrowser
+        webbrowser.open(url, new=2)
+        log("✅ 已为你打开浏览器，请切到浏览器窗口完成开通。")
+    except Exception:
+        log("（无法自动打开浏览器，请手动复制上方链接到浏览器打开）")
+    return False
+
+
+def ensure_ready():
+    """开箱即用入口：提取登录态 + 检测成长计划开通；
+    未开通则打开浏览器引导并退出（退出码 2，便于定时任务区分）。"""
+    extract_token()
+    if not ensure_growth_opened():
+        sys.exit(2)
 
 
 # ============================================================
@@ -488,7 +574,7 @@ def _fmt_seconds(s):
 
 
 def cmd_run():
-    extract_token()
+    ensure_ready()
     state = load_state()
 
     # 步骤 1：触发旅行（或复用 / 接管已有进行中的旅行）
@@ -559,7 +645,7 @@ def cmd_run():
 
 
 def cmd_start_only():
-    extract_token()
+    ensure_ready()
     state = load_state()
     if state.get("travel_started_at") and not state.get("claimed"):
         log("已有进行中的旅行记录，跳过重复触发。")
@@ -588,7 +674,7 @@ def cmd_start_only():
 
 
 def cmd_claim_only():
-    extract_token()
+    ensure_ready()
     state = load_state()
     record_id = state.get("record_id")
     if not state.get("travel_started_at"):
@@ -657,6 +743,9 @@ def cmd_status():
             state.get("record_id", "无")))
     if not has_token:
         return
+    # 已登录但成长计划未开通 → 自动打开浏览器引导开通
+    if not ensure_growth_opened():
+        sys.exit(2)
     log("--- 实时旅行状态 ---")
     try:
         code, resp = get_travel_status()
