@@ -36,6 +36,7 @@ license: MIT
    python scripts/cat_travel.py run
    ```
    脚本自动完成：提取本机登录态 → 触发旅行 → 按"旅行时长 + 15min 缓冲"自动等待到到达点 → 领取积分（幂等）。用户**无需填写 token、无需改任何文件**。
+   > **小白友好**：运行前会自动检测当前账号是否已开通「成长计划」，未开通则自动用系统默认浏览器打开开通页引导你完成（通常点一下即可），开通后重跑即可，无需手动找入口。
 2. **若运行环境不适长时 sleep**（如 WorkBuddy automation 不能常驻 2~4 小时），可拆成两个定时（见文末"可选定时任务"）：
    - `start-only`（触发并把"旅行时长 + 触发时间"写入状态文件）
    - `claim-only`（用状态文件里的"旅行时长 + 15min"自行判断是否到点：未到则自动等待、到点立即领取）
@@ -130,6 +131,7 @@ Linux/macOS（`crontab -e`，例如每天 6 点）：
 - **每日限额已到（`daily_limit_reached=true`）**：说明今日旅行已派发，无法再派新旅行，仅能领已有。
 - **目的地时长不同**：旅行时长直接取自服务器的 `arrive_at - depart_at`（咖啡馆 3h、其它 1~4h 不等），触发点 = 出发 + 旅行时长 + 15min，自动适配，无需手动调 4.5h；仅当旅行时长完全读不到才回退 4.5h 兜底。
 - **跨机器迁移**：路径常量已支持环境变量 `CAT_TRAVEL_NODE` / `CAT_TRAVEL_DECRYPT_JS` 覆盖，`DECRYPT_JS` 默认优先本 skill 自带 `scripts/decrypt-token.js`，无需改代码即可换机。
+- **未开通成长计划**：运行时会自动检测，未开通则自动打开浏览器到开通页（`{api_base}/activity/growth`，或 `CAT_TRAVEL_GROWTH_URL` 覆盖）引导开通，并退出码 2；开通后重跑即可，无需手动找入口。
 
 ## 令牌自动提取（为什么不需要配置凭证）
 
@@ -147,6 +149,17 @@ Linux/macOS（`crontab -e`，例如每天 6 点）：
 
 > 前提：本机必须已安装并登录 WorkBuddy 桌面端。若没登录，会提示「未找到本地登录态」，
 > 这与缺配置无关，是没登录桌面端。
+
+## 自动检测成长计划开通（小白引导）
+
+本 skill 面向小白设计：运行时会**自动检测当前账号是否已开通「成长计划」**，无需用户自己去找开通入口。
+
+- **检测方式**：调用只读接口 `/activity/growth/buddy/travel/status`，用强信号字段（`state` 枚举 / `daily_limit_reached` / `reward_credit`）判断；
+  401/403 或业务码非 0（含"未开通 / 未参与 / 未加入 / forbidden / 无权"等关键词）视为未开通。
+- **未开通时**：`ensure_growth_opened()` 打印友好中文提示，并**用系统默认浏览器自动打开开通页面**
+  （URL 默认 `{api_base}/activity/growth`，可用环境变量 `CAT_TRAVEL_GROWTH_URL` 覆盖），
+  通常用户只需在页面点一次「开通 / 加入」即可；随后脚本以退出码 2 结束，引导用户重跑。
+- **生效范围**：`run` / `start-only` / `claim-only` / `status` 全部命令，保证开箱即用。
 
 ## 安全说明
 
