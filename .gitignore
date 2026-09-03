@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# 运行产物 / 隐私文件，禁止入库
+*.db
+*.log
+*_state.json
+.env
+# setup 向导生成的 WorkBuddy 自动化配置（用户本地产物）
+workbuddy_automation_config.json

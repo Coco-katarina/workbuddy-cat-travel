@@ -107,24 +107,33 @@ python scripts/cat_travel.py setup
 向导会依次询问：
 1. **运行方式**：`单次手动执行`（推荐先试，随时自己 `run` / `daily`，不创建定时任务） / `配置为自动定时任务`。
    - 建议**先选单次手动执行**跑通一次、确认能领到积分后，再重跑本向导配置定时。
-2. **积分领取模式**（手动 / 定时都会问，决定 `run` / `daily` 的行为，二选一）：
-   - **当天领取（same-day）**：旅行最长 4 小时 + 额外 15 分钟缓冲，自动创建**两个**定时任务——
-     - `CatTravel-Start`：触发旅行（`start-only`）
-     - `CatTravel-Claim`：在「出发时间 + 4h15m」触发领取（`claim-only`，到点前自动等待）
+2. **定时领取方式**（仅选「自动定时」时出现，先确认领取策略再生成任务，三选一）：
+   - **到点自动领取（auto，推荐）**：到达触发时间后脚本自动判断并领取，无需你动手。
+   - **到点提醒手动领取（remind）**：定时任务仅发送提醒通知，由你手动运行 `claim-only` / `daily` 领取。
+   - **其他方式（other）**：先跳过领取自动化，后续由你自定义。
+3. **积分领取模式**（手动 / 定时都会问，决定 `run` / `daily` 的行为，二选一）：
+   - **当天领取（same-day）**：旅行最长 4 小时 + 额外 15 分钟缓冲，自动创建**派发任务**；领取任务根据上一步的「定时领取方式」生成——
+     - 自动领取：`CatTravel-Claim`（或 WorkBuddy 自动化「派猫猫旅行-领奖」）在「出发时间 + 4h15m」自动领取。
+     - 提醒手动：在同样时间点生成提醒任务，不自动调用领取接口。
+     - 其他方式：仅创建派发任务，领取由用户自行补充。
    - **隔天领取（next-day）**：每天先领取「昨日」积分、再开始「当日」旅行，自动创建**一个**定时任务——
-     - `CatTravel-Daily`：每天运行 `daily`（先领昨日、再派今日）
+     - 自动领取：`CatTravel-Daily`（或 WorkBuddy 自动化「派猫猫旅行-每日」）每天运行 `daily`。
+     - 提醒手动 / 其他方式：按对应策略生成提醒或跳过。
      - 首次运行因无昨日积分会导致领取失败，已做优雅处理（跳过领取并继续今日旅行），**后续每天正常运行**。
-3. **定时任务载体**（仅选「自动定时」时出现，二选一）：
+4. **定时任务载体**（仅选「自动定时」时出现，二选一）：
    - `系统计划任务`：Windows 任务计划 / macOS·Linux crontab，脚本**直接创建**，电脑睡眠也能跑，更稳。
    - `WorkBuddy 定时自动化`：脚本**生成配置**（`workbuddy_automation_config.json`，含每个自动化的名称 / 时间 / 指令），你在 WorkBuddy「自动化」里逐条创建或粘贴即可；依赖 WorkBuddy 在触发时刻运行（睡眠不跑）。
-4. **触发时间**（HH:MM）：**完全由你定**——常几点开机 / 在线就填几点（默认 09:00 仅为建议，无强制要求）。
+5. **触发时间**（HH:MM）：**完全由你定**——常几点开机 / 在线就填几点（默认 09:00 仅为建议，无强制要求）。
+6. **文件存放位置**（仅选「WorkBuddy 定时自动化」时出现）：
+   - 向导会主动提示「脚本所在目录不便于长期管理」，并询问你希望把 `workbuddy_automation_config.json` 保存到哪个磁盘或目录。
+   - 默认推荐 `~/.workbuddy/cache/cat-travel/`（升级 skill 不丢失），也支持自定义其他目录；**等待用户确认选择后再继续生成配置**。
 
 - 选「系统计划任务」：向导按平台自动创建——Windows `schtasks` / macOS·Linux `crontab`（带 `cat-travel` 标记的区块，重跑自动清理旧任务）。
-- 选「WorkBuddy 定时自动化」：向导生成 `workbuddy_automation_config.json`，你在 WorkBuddy「自动化」里逐条创建或粘贴即可。
+- 选「WorkBuddy 定时自动化」：向导先让你确认存放目录，再生成 `workbuddy_automation_config.json`，你在 WorkBuddy「自动化」里逐条创建或粘贴即可。
 
 配置保存在用户缓存目录（`~/.workbuddy/cache/cat-travel/cat_travel_config.json`），**不写入 skill 仓库**，可随时重跑 `setup` 修改。
 
-非交互/自动化安装可用环境变量跳过问答：`CAT_TRAVEL_RUN_MODE=manual|scheduled`、`CAT_TRAVEL_CLAIM_MODE=same-day|next-day`、`CAT_TRAVEL_SCHEDULE_BACKEND=system|workbuddy`、`CAT_TRAVEL_TRIGGER=HH:MM`。
+非交互/自动化安装可用环境变量跳过问答：`CAT_TRAVEL_RUN_MODE=manual|scheduled`、`CAT_TRAVEL_SCHEDULED_CLAIM_METHOD=auto|remind|other`、`CAT_TRAVEL_CLAIM_MODE=same-day|next-day`、`CAT_TRAVEL_SCHEDULE_BACKEND=system|workbuddy`、`CAT_TRAVEL_TRIGGER=HH:MM`。
 
 > 说明：本 skill **默认不写入任何定时任务**，只有用户主动运行 `setup` 选了「自动定时」才会创建。想接微信/邮件通知，在脚本外层包一层推送即可（本 skill 不含推送实现）。
 

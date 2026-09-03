@@ -91,16 +91,21 @@ python scripts/cat_travel.py setup
 向导依次询问：
 1. **运行方式**：`单次手动执行`（推荐先试，随时自己 `run` / `daily`，不创建定时任务） / `配置为自动定时任务`。
    - 建议先跑通一次确认能领到积分，再重跑本向导配置定时，体验更稳。
-2. **领取模式**（手动 / 定时都会问，决定 `run` / `daily` 行为）：
-   - **当天领取**：旅行最长 4h + 15min 缓冲，自动建 **2 个**任务（旅行 + 缓冲后领取）。
-   - **隔天领取**：每天先领昨日积分再派今日旅行，自动建 **1 个** `daily` 任务；首次运行无昨日积分会自动跳过，不报错。
-3. **定时任务载体**（仅选定时时）：`系统计划任务`（Windows 任务计划 / macOS·Linux crontab，脚本直接建、睡眠也能跑、更稳） / `WorkBuddy 定时自动化`（生成配置，你在 WorkBuddy 里点一下创建，依赖 App 运行）。
-4. **触发时间**（HH:MM）：**由你定**——常几点开机/在线就填几点（默认 09:00 仅建议，无强制）。
+2. **定时领取方式**（仅选「自动定时」时）：先问清楚再生成任务，三选一：
+   - **到点自动领取**：触发时间后脚本自动判断并领取，无需动手。
+   - **到点提醒手动领取**：仅发送提醒，由你手动运行 `claim-only` / `daily` 领取。
+   - **其他方式**：先跳过领取自动化，后续自定义。
+3. **领取模式**（手动 / 定时都会问，决定 `run` / `daily` 行为）：
+   - **当天领取**：旅行最长 4h + 15min 缓冲，自动建派发任务；领取任务按上一步选择的领取方式生成（自动 / 提醒 / 跳过）。
+   - **隔天领取**：每天先领昨日积分再派今日旅行，自动建 `daily` 任务（或提醒 / 跳过）；首次运行无昨日积分会自动跳过，不报错。
+4. **定时任务载体**（仅选定时时）：`系统计划任务`（Windows 任务计划 / macOS·Linux crontab，脚本直接建、睡眠也能跑、更稳） / `WorkBuddy 定时自动化`（生成配置，你在 WorkBuddy 里点一下创建，依赖 App 运行）。
+5. **触发时间**（HH:MM）：**由你定**——常几点开机/在线就填几点（默认 09:00 仅建议，无强制）。
+6. **文件存放位置**（仅选「WorkBuddy 定时自动化」时）：向导会提示脚本目录不便于长期管理，询问你希望保存到哪个磁盘/目录，默认推荐 `~/.workbuddy/cache/cat-travel/`，确认后再生成配置。
 
 - 选「系统计划任务」：Windows `schtasks`（`CatTravel-Start` / `CatTravel-Claim` / `CatTravel-Daily`），macOS·Linux `crontab`（带 `cat-travel` 标记区块，重跑自动清理旧任务）。
-- 选「WorkBuddy 定时自动化」：生成 `workbuddy_automation_config.json`（含各自动化的名称 / 时间 / 指令），在 WorkBuddy「自动化」里逐条创建或粘贴即可。
+- 选「WorkBuddy 定时自动化」：先确认存放目录，再生成 `workbuddy_automation_config.json`（含各自动化的名称 / 时间 / 指令），在 WorkBuddy「自动化」里逐条创建或粘贴即可。
 
-> 自动化/CI 可用环境变量跳过问答：`CAT_TRAVEL_RUN_MODE=manual|scheduled`、`CAT_TRAVEL_CLAIM_MODE=same-day|next-day`、`CAT_TRAVEL_SCHEDULE_BACKEND=system|workbuddy`、`CAT_TRAVEL_TRIGGER=HH:MM`。
+> 自动化/CI 可用环境变量跳过问答：`CAT_TRAVEL_RUN_MODE=manual|scheduled`、`CAT_TRAVEL_SCHEDULED_CLAIM_METHOD=auto|remind|other`、`CAT_TRAVEL_CLAIM_MODE=same-day|next-day`、`CAT_TRAVEL_SCHEDULE_BACKEND=system|workbuddy`、`CAT_TRAVEL_TRIGGER=HH:MM`、`CAT_TRAVEL_AUTOMATION_DIR=<目录路径>`。
 
 ## 可选定时任务（手动兜底）
 
