@@ -1,7 +1,7 @@
 ---
 name: cat-travel
 description: WorkBuddy 成长计划「派猫猫旅行」自动派发与积分领取。自动解密本机登录态，调用旅行触发与领取接口完成每日积分获取，并支持定时任务与接口抓包补全。触发词：派猫猫旅行、自动去旅行、猫猫旅行、领猫猫积分、buddy travel、travel claim。
-version: "1.0.0"
+version: "1.1.0"
 license: MIT
 ---
 
@@ -84,43 +84,58 @@ license: MIT
 ## 示例
 
 ```bash
-# 查看状态
+# 安装向导（选手动/定时 + 领取模式 + 载体，自动建定时）
+python scripts/cat_travel.py setup
+# 查看状态与已选配置
 python scripts/cat_travel.py status
-# 仅领奖（今日已派发且到达）
+# 仅领奖（今日已派发且到达 / 当天模式补领）
 python scripts/cat_travel.py claim-only
-# 完整流程（触发接口已确认时）
+# 完整流程（触发接口已确认时，单次手动）
 python scripts/cat_travel.py run
+# 隔天模式每日任务：先领昨日积分，再开始今日旅行
+python scripts/cat_travel.py daily
 ```
 
-## 可选定时任务（是否启用、什么时间由用户决定）
+## 安装交互（setup 向导）
 
-本 skill **默认不写入任何定时任务**。每日自动领取是可选增强，由用户自行决定要不要、几点跑。
+其他用户下载安装本 skill 后，**无需手动写任何定时任务**，直接运行安装向导即可按提示选择运行方式：
 
-**方案 A：WorkBuddy 定时自动化（最简单，但依赖 App 在触发时刻运行）**
-时间填用户觉得合适的时刻（下面 `BYHOUR`/`BYMINUTE` 仅为示例）：
-```json
-{
-  "name": "派猫猫旅行-领奖",
-  "scheduleType": "recurring",
-  "rrule": "FREQ=DAILY;BYHOUR=13;BYMINUTE=30",
-  "cwds": ["<工作目录>"],
-  "status": "ACTIVE",
-  "prompt": "运行 python scripts/cat_travel.py claim-only（仅领已有旅行，无需 start 接口）。汇报：领取成功得几分 / 无可领（今日已领或还没派发） / 令牌失效需刷新登录。"
-}
-```
-> 注意：WorkBuddy 自动化在电脑**睡眠/休眠时不会执行**。若常睡眠，优先方案 B。
-
-**方案 B：系统计划任务（睡眠也能唤醒，更稳）**
-Windows（时间自行替换 `06:00`）：
-```powershell
-schtasks /Create /TN "CatTravelDaily" /SC DAILY /ST 06:00 /TR "cmd /c cd /d <脚本目录> && python scripts/cat_travel.py run"
-```
-Linux/macOS（`crontab -e`，例如每天 6 点）：
-```cron
-0 6 * * * cd <脚本目录> && python3 scripts/cat_travel.py run >> cat_travel_cron.log 2>&1
+```bash
+python scripts/cat_travel.py setup
 ```
 
-> 成功后想接微信/邮件通知，自行在脚本外层包一层推送即可（本 skill 不含推送实现，避免内置第三方凭证）。
+向导会依次询问：
+1. **运行方式**：`单次手动执行`（推荐先试，随时自己 `run` / `daily`，不创建定时任务） / `配置为自动定时任务`。
+   - 建议**先选单次手动执行**跑通一次、确认能领到积分后，再重跑本向导配置定时。
+2. **积分领取模式**（手动 / 定时都会问，决定 `run` / `daily` 的行为，二选一）：
+   - **当天领取（same-day）**：旅行最长 4 小时 + 额外 15 分钟缓冲，自动创建**两个**定时任务——
+     - `CatTravel-Start`：触发旅行（`start-only`）
+     - `CatTravel-Claim`：在「出发时间 + 4h15m」触发领取（`claim-only`，到点前自动等待）
+   - **隔天领取（next-day）**：每天先领取「昨日」积分、再开始「当日」旅行，自动创建**一个**定时任务——
+     - `CatTravel-Daily`：每天运行 `daily`（先领昨日、再派今日）
+     - 首次运行因无昨日积分会导致领取失败，已做优雅处理（跳过领取并继续今日旅行），**后续每天正常运行**。
+3. **定时任务载体**（仅选「自动定时」时出现，二选一）：
+   - `系统计划任务`：Windows 任务计划 / macOS·Linux crontab，脚本**直接创建**，电脑睡眠也能跑，更稳。
+   - `WorkBuddy 定时自动化`：脚本**生成配置**（`workbuddy_automation_config.json`，含每个自动化的名称 / 时间 / 指令），你在 WorkBuddy「自动化」里逐条创建或粘贴即可；依赖 WorkBuddy 在触发时刻运行（睡眠不跑）。
+4. **触发时间**（HH:MM）：**完全由你定**——常几点开机 / 在线就填几点（默认 09:00 仅为建议，无强制要求）。
+
+- 选「系统计划任务」：向导按平台自动创建——Windows `schtasks` / macOS·Linux `crontab`（带 `cat-travel` 标记的区块，重跑自动清理旧任务）。
+- 选「WorkBuddy 定时自动化」：向导生成 `workbuddy_automation_config.json`，你在 WorkBuddy「自动化」里逐条创建或粘贴即可。
+
+配置保存在用户缓存目录（`~/.workbuddy/cache/cat-travel/cat_travel_config.json`），**不写入 skill 仓库**，可随时重跑 `setup` 修改。
+
+非交互/自动化安装可用环境变量跳过问答：`CAT_TRAVEL_RUN_MODE=manual|scheduled`、`CAT_TRAVEL_CLAIM_MODE=same-day|next-day`、`CAT_TRAVEL_SCHEDULE_BACKEND=system|workbuddy`、`CAT_TRAVEL_TRIGGER=HH:MM`。
+
+> 说明：本 skill **默认不写入任何定时任务**，只有用户主动运行 `setup` 选了「自动定时」才会创建。想接微信/邮件通知，在脚本外层包一层推送即可（本 skill 不含推送实现）。
+
+## 可选定时任务（手动兜底）
+
+若自动创建失败（无权限 / 非桌面环境），按 `setup` 末尾打印的参考命令手动创建即可；两种模式要点：
+
+- **当天领取**：需 2 个任务。旅行任务 `python scripts/cat_travel.py start-only`，缓冲领取任务 `python scripts/cat_travel.py claim-only`，后者时间 = 旅行任务时间 + 4h15m（最长旅行 4h + 15min 缓冲）。
+- **隔天领取**：需 1 个任务。每日 `python scripts/cat_travel.py daily`。
+
+**WorkBuddy 定时自动化（最简单，但依赖 App 在触发时刻运行）** 也支持，把 `prompt` 写成对应命令即可；注意 WorkBuddy 自动化在电脑**睡眠/休眠时不会执行**，常睡眠优先用系统计划任务。
 
 ## 边界情况
 
@@ -132,6 +147,8 @@ Linux/macOS（`crontab -e`，例如每天 6 点）：
 - **目的地时长不同**：旅行时长直接取自服务器的 `arrive_at - depart_at`（咖啡馆 3h、其它 1~4h 不等），触发点 = 出发 + 旅行时长 + 15min，自动适配，无需手动调 4.5h；仅当旅行时长完全读不到才回退 4.5h 兜底。
 - **跨机器迁移**：路径常量已支持环境变量 `CAT_TRAVEL_NODE` / `CAT_TRAVEL_DECRYPT_JS` 覆盖，`DECRYPT_JS` 默认优先本 skill 自带 `scripts/decrypt-token.js`，无需改代码即可换机。
 - **未开通成长计划**：运行时会自动检测，未开通则自动打开浏览器到开通页（`{api_base}/activity/growth`，或 `CAT_TRAVEL_GROWTH_URL` 覆盖）引导开通，并退出码 2；开通后重跑即可，无需手动找入口。
+- **隔天模式首次运行无昨日积分**：`daily` 首日状态为空，领取步骤被安全跳过（不调用领取接口），直接进入「开始今日旅行」，不会因「无可领旅行」报错退出；次日会正常领取首日积分。即使某日领取接口返回 `no unclaimed travel`，也判为已领/无需领并标记完成，继续今日旅行，保证每日任务不中断。
+- **当天 vs 隔天领取的区别**：当天领取把「派发」和「领取」拆成两个任务（旅行 + 4h15m 缓冲），当天即可拿到积分；隔天领取每天先结昨日账再派今日，首次拿积分要等到第二天。两者都保证「先旅行结束、再领取」的顺序，不会未到就领。
 
 ## 令牌自动提取（为什么不需要配置凭证）
 

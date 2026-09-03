@@ -49,6 +49,8 @@ python scripts/cat_travel.py run
 
 第 3 条 `run` 一个命令就完成「派发 + 等待 + 领积分」，**下载后啥也不用动**。
 
+> 想要**每天自动跑**，先运行一次 `python scripts/cat_travel.py setup` 选好运行方式与领取模式（当天领取 / 隔天领取），向导会自动建好系统定时任务；隔天模式下每日运行 `python scripts/cat_travel.py daily` 即可「先领昨日、再派今日」。
+
 > 若你的账号还没开通「成长计划」，脚本会**自动用浏览器打开开通页**引导你点一下开通，开通后重跑即可——无需你自己去找入口。
 
 ## 令牌自动提取机制（为什么无需配置凭证）
@@ -78,50 +80,55 @@ python scripts/cat_travel.py run
 
 开通页地址默认 `https://www.workbuddy.cn/activity/growth`，也可用环境变量 `CAT_TRAVEL_GROWTH_URL` 指定。
 
-## 可选定时任务（是否启用、什么时间由你决定）
+## 自动定时（安装向导，推荐）
 
-本 skill **默认不写入任何定时任务**。每日自动领取是可选增强，由你自行决定要不要、几点跑。
+本 skill **默认不写入任何定时任务**。想每天自动跑，直接运行安装向导，按提示选即可，**无需手敲任何命令**：
 
-### 方案 A：WorkBuddy 定时自动化（最简单，但依赖 App 在触发时刻运行）
-
-在 WorkBuddy 创建两个 recurring 自动化（时间填**你觉得合适的时刻**）：
-
-```json
-{
-  "name": "派猫猫旅行-触发",
-  "scheduleType": "recurring",
-  "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-  "cwds": ["<脚本所在目录>"],
-  "status": "ACTIVE",
-  "prompt": "运行 python scripts/cat_travel.py start-only（派发旅行并写入到达时间）。"
-}
+```bash
+python scripts/cat_travel.py setup
 ```
-```json
-{
-  "name": "派猫猫旅行-领奖",
-  "scheduleType": "recurring",
-  "rrule": "FREQ=DAILY;BYHOUR=13;BYMINUTE=30",
-  "cwds": ["<脚本所在目录>"],
-  "status": "ACTIVE",
-  "prompt": "运行 python scripts/cat_travel.py claim-only（按旅行时长自动判断到点后领取，幂等）。"
-}
-```
+
+向导依次询问：
+1. **运行方式**：`单次手动执行`（推荐先试，随时自己 `run` / `daily`，不创建定时任务） / `配置为自动定时任务`。
+   - 建议先跑通一次确认能领到积分，再重跑本向导配置定时，体验更稳。
+2. **领取模式**（手动 / 定时都会问，决定 `run` / `daily` 行为）：
+   - **当天领取**：旅行最长 4h + 15min 缓冲，自动建 **2 个**任务（旅行 + 缓冲后领取）。
+   - **隔天领取**：每天先领昨日积分再派今日旅行，自动建 **1 个** `daily` 任务；首次运行无昨日积分会自动跳过，不报错。
+3. **定时任务载体**（仅选定时时）：`系统计划任务`（Windows 任务计划 / macOS·Linux crontab，脚本直接建、睡眠也能跑、更稳） / `WorkBuddy 定时自动化`（生成配置，你在 WorkBuddy 里点一下创建，依赖 App 运行）。
+4. **触发时间**（HH:MM）：**由你定**——常几点开机/在线就填几点（默认 09:00 仅建议，无强制）。
+
+- 选「系统计划任务」：Windows `schtasks`（`CatTravel-Start` / `CatTravel-Claim` / `CatTravel-Daily`），macOS·Linux `crontab`（带 `cat-travel` 标记区块，重跑自动清理旧任务）。
+- 选「WorkBuddy 定时自动化」：生成 `workbuddy_automation_config.json`（含各自动化的名称 / 时间 / 指令），在 WorkBuddy「自动化」里逐条创建或粘贴即可。
+
+> 自动化/CI 可用环境变量跳过问答：`CAT_TRAVEL_RUN_MODE=manual|scheduled`、`CAT_TRAVEL_CLAIM_MODE=same-day|next-day`、`CAT_TRAVEL_SCHEDULE_BACKEND=system|workbuddy`、`CAT_TRAVEL_TRIGGER=HH:MM`。
+
+## 可选定时任务（手动兜底）
+
+若自动创建失败（无权限 / 非桌面环境），按 `setup` 末尾打印的参考手动创建：
+- **当天领取**：2 个任务。旅行任务 `python scripts/cat_travel.py start-only`；领取任务 `python scripts/cat_travel.py claim-only`，时间 = 旅行任务时间 + 4h15m。
+- **隔天领取**：1 个任务。每天 `python scripts/cat_travel.py daily`。
+
+### WorkBuddy 定时自动化（依赖 App 在触发时刻运行）
+
+在 `setup` 向导选「WorkBuddy 定时自动化」后会生成 `workbuddy_automation_config.json`，直接粘进 WorkBuddy「自动化」即可；或手动创建 recurring 自动化（时间填**你觉得合适的时刻**，prompt 写对应命令）：`start-only`（派发） / `claim-only`（当天领） / `daily`（隔天领）。
 
 > 注意：WorkBuddy 自动化在电脑**睡眠/休眠时不会执行**（实测连续多天 9:00 零记录）。
-> 若你的电脑常睡眠，优先用方案 B。
+> 若你的电脑常睡眠，优先用系统计划任务（方案 B）。
 
 ### 方案 B：系统计划任务（睡眠也能唤醒，更稳）
 
-Windows 用 `schtasks` 注册（时间自行替换 `06:00`）：
+Windows 用 `schtasks` 注册（时间自行替换 `09:00`，隔天模式用 `daily` 一个任务）：
 
 ```powershell
-schtasks /Create /TN "CatTravelDaily" /SC DAILY /ST 06:00 /TR "cmd /c cd /d <脚本目录> && python scripts/cat_travel.py run"
+schtasks /Create /TN "CatTravel-Start" /SC DAILY /ST 09:00 /TR "cmd /c python scripts/cat_travel.py start-only"
+schtasks /Create /TN "CatTravel-Claim" /SC DAILY /ST 13:15 /TR "cmd /c python scripts/cat_travel.py claim-only"
 ```
 
-Linux/macOS 用 `crontab -e` 加一行（时间自行替换，例如每天 6 点）：
+Linux/macOS 用 `crontab -e` 加一行（时间自行替换，例如每天 9 点，隔天模式用 `daily`）：
 
 ```cron
-0 6 * * * cd <脚本目录> && python3 scripts/cat_travel.py run >> cat_travel_cron.log 2>&1
+0 9 * * * cd <脚本目录> && python3 scripts/cat_travel.py start-only >> cat_travel_cron.log 2>&1
+15 13 * * * cd <脚本目录> && python3 scripts/cat_travel.py claim-only >> cat_travel_cron.log 2>&1
 ```
 
 成功后想接微信/邮件通知，自行在脚本外层包一层推送即可（本仓库不含推送实现，避免内置第三方凭证）。
