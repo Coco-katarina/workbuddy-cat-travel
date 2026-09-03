@@ -382,6 +382,8 @@ def load_config():
     cfg.setdefault("run_mode", None)       # manual / scheduled
     cfg.setdefault("claim_mode", None)     # same-day / next-day
     cfg.setdefault("schedule_backend", "system")  # system / workbuddy
+    cfg.setdefault("scheduled_claim_method", "auto")  # auto / remind / other
+    cfg.setdefault("automation_dir", None)  # WorkBuddy 自动化配置存放目录
     cfg.setdefault("trigger_hh", 9)
     cfg.setdefault("trigger_mm", 0)
     return cfg
@@ -800,7 +802,12 @@ def cmd_status():
     log("--- 已选配置 ---")
     log("运行方式：%s" % ("手动" if cfg.get("run_mode") == "manual" else ("自动定时" if cfg.get("run_mode") == "scheduled" else "未配置（请运行 setup）")))
     if cfg.get("run_mode") == "scheduled":
+        method_map = {"auto": "到点自动领取", "remind": "到点提醒手动领取", "other": "其他方式"}
+        log("定时领取方式：%s" % method_map.get(cfg.get("scheduled_claim_method", "auto"), cfg.get("scheduled_claim_method", "auto")))
         log("领取模式：%s" % ("当天领取" if cfg.get("claim_mode") == "same-day" else "隔天领取"))
+        log("定时载体：%s" % ("系统计划任务" if cfg.get("schedule_backend") == "system" else "WorkBuddy 自动化"))
+        if cfg.get("schedule_backend") == "workbuddy" and cfg.get("automation_dir"):
+            log("自动化配置目录：%s" % cfg["automation_dir"])
         log("触发时间：%02d:%02d" % (cfg.get("trigger_hh", 9), cfg.get("trigger_mm", 0)))
 
     has_token = True
@@ -879,6 +886,74 @@ def _prompt_choice(prompt, choices, default_key=None):
         print("  输入无效，请重新选择。")
 
 
+def _prompt_automation_dir(cfg):
+    """使用 WorkBuddy 自动化时，提示用户选择配置/状态文件的存放目录。
+
+    默认把 workbuddy_automation_config.json 放在脚本所在目录，但 skill 目录不便于长期管理
+    （升级、迁移或清理时容易误删）。因此主动询问用户希望保存到哪个磁盘或目录，
+    等待确认后再继续生成配置。
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_cache = os.path.join(os.path.expanduser("~"), ".workbuddy", "cache", "cat-travel")
+    # 环境变量 / 已保存配置优先级最高，方便非交互/自动化安装
+    env_dir = os.environ.get("CAT_TRAVEL_AUTOMATION_DIR")
+    if env_dir:
+        d = os.path.abspath(os.path.expanduser(env_dir))
+        try:
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            pass
+    current = cfg.get("automation_dir") or default_cache
+
+    print("")
+    print("💾 文件存放位置")
+    print("   当前 WorkBuddy 自动化配置默认准备保存在脚本所在目录：")
+    print("     %s" % script_dir)
+    print("   这个目录不便于长期管理（skill 升级/迁移时容易丢失配置），建议更换。")
+
+    if not sys.stdin.isatty():
+        print("   （当前为非交互环境，使用默认目录：%s）" % current)
+        try:
+            os.makedirs(current, exist_ok=True)
+        except Exception:
+            pass
+        return current
+
+    while True:
+        print("")
+        print("请选择文件存放位置：")
+        print("  1) 使用默认缓存目录（推荐，升级 skill 不丢失）：%s" % default_cache)
+        print("  2) 继续使用脚本所在目录：%s" % script_dir)
+        print("  3) 自定义目录（请输入完整路径，如 D:\\CatTravel 或 /home/xxx/cat-travel）")
+        inp = input("请选择 [1]: ").strip()
+        if not inp or inp == "1":
+            d = default_cache
+        elif inp == "2":
+            d = script_dir
+        elif inp == "3":
+            d = input("   请输入完整目录路径：").strip()
+            if not d:
+                print("   路径为空，请重新选择。")
+                continue
+            d = os.path.abspath(os.path.expanduser(d))
+        else:
+            print("   输入无效，请重新选择。")
+            continue
+
+        try:
+            os.makedirs(d, exist_ok=True)
+            # 简单校验目录可写
+            test_file = os.path.join(d, ".write_test")
+            with open(test_file, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test_file)
+            print("   ✅ 已确认使用目录：%s" % d)
+            return d
+        except Exception as e:
+            print("   无法使用该目录（%s），请重新选择。" % e)
+
+
 def cmd_setup():
     print("=" * 60)
     print("  派猫猫旅行 · 安装向导")
@@ -902,11 +977,23 @@ def cmd_setup():
         run_mode = {"1": "manual", "2": "scheduled"}.get(k, "manual")
     cfg["run_mode"] = run_mode
 
-    # ---------- ② 积分领取模式（手动 / 定时都要知道，run / daily 用得到） ----------
+    # ---------- ② 定时领取方式（仅自动定时需要；先生成领取策略，再决定任务结构） ----------
+    scheduled_claim_method = os.environ.get("CAT_TRAVEL_SCHEDULED_CLAIM_METHOD")
+    if run_mode == "scheduled" and scheduled_claim_method not in ("auto", "remind", "other"):
+        k = _prompt_choice(
+            "② 每日定时任务如何领取积分？",
+            [("1", "到点自动领取（推荐）：到达触发时间后脚本自动判断并领取，无需你动手"),
+             ("2", "到点提醒手动领取：仅发送提醒通知，由你手动运行 claim-only / daily 领取"),
+             ("3", "其他方式：先跳过领取自动化，后续由你自定义")],
+            default_key="1")
+        scheduled_claim_method = {"1": "auto", "2": "remind", "3": "other"}.get(k, "auto")
+    cfg["scheduled_claim_method"] = scheduled_claim_method or "auto"
+
+    # ---------- ③ 积分领取模式（手动 / 定时都要知道，run / daily 用得到） ----------
     claim_mode = os.environ.get("CAT_TRAVEL_CLAIM_MODE")
     if claim_mode not in ("same-day", "next-day"):
         k = _prompt_choice(
-            "② 积分领取模式？",
+            "③ 积分领取模式？",
             [("1", "当天领取：一次 run 完成「派发 + 等待 + 领积分」（最长 4h+15min 缓冲）"),
              ("2", "隔天领取：用 daily，每天先领「昨日」积分再派「当日」旅行（首次无昨日会自动跳过）")],
             default_key="1")
@@ -927,22 +1014,22 @@ def cmd_setup():
         print("（想改成自动定时，重跑 `python scripts/cat_travel.py setup` 即可。）")
         return
 
-    # ---------- ③ 定时任务载体 ----------
+    # ---------- ④ 定时任务载体 ----------
     backend = os.environ.get("CAT_TRAVEL_SCHEDULE_BACKEND")
     if backend not in ("system", "workbuddy"):
         k = _prompt_choice(
-            "③ 定时任务由谁负责调度？",
+            "④ 定时任务由谁负责调度？",
             [("1", "系统计划任务（Windows 任务计划 / macOS·Linux crontab）——脚本直接创建，电脑睡眠也能跑，更稳"),
              ("2", "WorkBuddy 定时自动化——生成配置后你在 WorkBuddy 里点一下创建；依赖 WorkBuddy 在触发时刻运行（睡眠不跑）")],
             default_key="1")
         backend = {"1": "system", "2": "workbuddy"}.get(k, "system")
     cfg["schedule_backend"] = backend
 
-    # ---------- ④ 触发时间（用户自己定） ----------
+    # ---------- ⑤ 触发时间（用户自己定） ----------
     trigger = os.environ.get("CAT_TRAVEL_TRIGGER")
     if not trigger and sys.stdin.isatty():
         print("")
-        print("④ 每日触发时间：你常几点开机 / 在线就填几点（例如常 9 点开电脑填 09:00）。")
+        print("⑤ 每日触发时间：你常几点开机 / 在线就填几点（例如常 9 点开电脑填 09:00）。")
         print("   时间完全由你定，没有强制要求；下面只是默认值建议。")
     if not trigger:
         if sys.stdin.isatty():
@@ -958,7 +1045,7 @@ def cmd_setup():
     cfg["trigger_mm"] = mm
     save_config(cfg)
 
-    # ---------- ⑤ 执行 ----------
+    # ---------- ⑥ 执行 ----------
     print("")
     if backend == "system":
         print("正在创建系统定时任务（%s / 触发时间 %02d:%02d）..." % (
@@ -973,12 +1060,17 @@ def cmd_setup():
             print("   你可手动按下面的命令创建；或把报错反馈给作者。")
         _print_manual_schedule_hint(cfg)
     else:
+        # WorkBuddy 自动化：先确认文件存放目录，再生成配置
+        automation_dir = _prompt_automation_dir(cfg)
+        cfg["automation_dir"] = automation_dir
+        save_config(cfg)
         print("正在生成 WorkBuddy 定时自动化配置（%s / 触发时间 %02d:%02d）..." % (
             "当天领取" if claim_mode == "same-day" else "隔天领取", hh, mm))
         _emit_workbuddy_automation(cfg)
         print("")
         print("✅ WorkBuddy 自动化配置已生成。配置已保存到：")
         print("   %s" % CONFIG["config_file"])
+        print("   自动化 JSON 存放目录：%s" % cfg.get("automation_dir", "脚本所在目录"))
 
     print("")
     print("💡 最后建议：先手动跑一次确认能领到积分，再放心依赖定时任务。")
@@ -1007,6 +1099,8 @@ def _emit_workbuddy_automation(cfg):
     hh = cfg["trigger_hh"]; mm = cfg["trigger_mm"]
     script_dir = os.path.dirname(os.path.abspath(__file__))
     abs_script = os.path.join(script_dir, "cat_travel.py")
+    automation_dir = cfg.get("automation_dir") or script_dir
+    claim_method = cfg.get("scheduled_claim_method", "auto")
 
     def rrule(h, m):
         return "FREQ=DAILY;BYHOUR=%d;BYMINUTE=%d" % (h, m)
@@ -1018,7 +1112,7 @@ def _emit_workbuddy_automation(cfg):
             "start_mm": m,
             "scheduleType": "recurring",
             "rrule": rrule(h, m),
-            "cwds": [script_dir],
+            "cwds": [automation_dir],
             "status": "ACTIVE",
             "prompt": prompt,
         }
@@ -1027,36 +1121,79 @@ def _emit_workbuddy_automation(cfg):
         total = hh * 60 + mm + int(CONFIG["travel_max_hours"]) * 60 + int(CONFIG["claim_buffer_seconds"] // 60)
         ch = (total // 60) % 24
         cm = total % 60
-        autos = [
-            make("派猫猫旅行-触发@%02d:%02d" % (hh, mm), hh, mm,
-                 "运行 `python \"%s\" start-only` 派发猫猫旅行并写入到达时间。若提示未开通成长计划，则打开浏览器引导开通；完成后汇报：派发成功 / 已在进行中无需重复 / 令牌失效需刷新登录。" % abs_script),
-            make("派猫猫旅行-领奖@%02d:%02d" % (ch, cm), ch, cm,
-                 "运行 `python \"%s\" claim-only` 按旅行时长自动判断到点后领取积分（幂等）。汇报：领取成功得几分 / 无可领（今日已领或还没派发） / 令牌失效需刷新登录。" % abs_script),
-        ]
+        start_auto = make("派猫猫旅行-触发@%02d:%02d" % (hh, mm), hh, mm,
+                          "运行 `python \"%s\" start-only` 派发猫猫旅行并写入到达时间。若提示未开通成长计划，则打开浏览器引导开通；完成后汇报：派发成功 / 已在进行中无需重复 / 令牌失效需刷新登录。" % abs_script)
+        if claim_method == "remind":
+            autos = [
+                start_auto,
+                make("派猫猫旅行-领奖提醒@%02d:%02d" % (ch, cm), ch, cm,
+                     "提醒小主：猫猫旅行预计已到达，请手动运行 `python \"%s\" claim-only` 领取积分。" % abs_script),
+            ]
+        elif claim_method == "other":
+            autos = [start_auto]
+        else:
+            autos = [
+                start_auto,
+                make("派猫猫旅行-领奖@%02d:%02d" % (ch, cm), ch, cm,
+                     "运行 `python \"%s\" claim-only` 按旅行时长自动判断到点后领取积分（幂等）。汇报：领取成功得几分 / 无可领（今日已领或还没派发） / 令牌失效需刷新登录。" % abs_script),
+            ]
     else:
-        autos = [
-            make("派猫猫旅行-每日@%02d:%02d" % (hh, mm), hh, mm,
-                 "运行 `python \"%s\" daily`：先领昨日积分（无昨日则安全跳过），再派发今日旅行。首次运行无昨日积分属正常。汇报：领取结果 / 已派发 / 令牌失效需刷新登录。" % abs_script),
-        ]
+        if claim_method == "remind":
+            autos = [
+                make("派猫猫旅行-每日提醒@%02d:%02d" % (hh, mm), hh, mm,
+                     "提醒小主：请手动运行 `python \"%s\" daily` 完成昨日积分领取和今日旅行派发。" % abs_script),
+            ]
+        elif claim_method == "other":
+            autos = []
+        else:
+            autos = [
+                make("派猫猫旅行-每日@%02d:%02d" % (hh, mm), hh, mm,
+                     "运行 `python \"%s\" daily`：先领昨日积分（无昨日则安全跳过），再派发今日旅行。首次运行无昨日积分属正常。汇报：领取结果 / 已派发 / 令牌失效需刷新登录。" % abs_script),
+            ]
 
-    out = os.path.join(script_dir, "workbuddy_automation_config.json")
-    try:
-        with open(out, "w", encoding="utf-8") as f:
-            json.dump(autos, f, ensure_ascii=False, indent=2)
-        log("WorkBuddy 自动化配置已生成：%s" % out)
-    except Exception as e:
-        log("写入 WB 配置失败：%s" % e)
-
-    print("  ✅ 配置已写入：%s" % out)
-    print("")
-    print("  在 WorkBuddy 中创建自动化的方法（逐条创建）：")
-    for a in autos:
-        print("   · 名称：%s" % a["name"])
-        print("     时间：每天 %02d:%02d（rrule: %s）" % (a["start_hh"], a["start_mm"], a["rrule"]))
-        print("     指令：%s" % a["prompt"])
+    out = os.path.join(automation_dir, "workbuddy_automation_config.json")
+    if autos:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(autos, f, ensure_ascii=False, indent=2)
+            log("WorkBuddy 自动化配置已生成：%s" % out)
+        except Exception as e:
+            log("写入 WB 配置失败：%s" % e)
+        print("  ✅ 配置已写入：%s" % out)
         print("")
-    print("  提示：把上面 JSON 文件内容直接粘进 WorkBuddy 自动化即可创建；")
-    print("        或按上面逐条在 WorkBuddy「自动化」里手动创建（名称 / 时间 / 指令照抄）。")
+        print("  在 WorkBuddy 中创建自动化的方法（逐条创建）：")
+        for a in autos:
+            print("   · 名称：%s" % a["name"])
+            print("     时间：每天 %02d:%02d（rrule: %s）" % (a["start_hh"], a["start_mm"], a["rrule"]))
+            print("     指令：%s" % a["prompt"])
+            print("")
+        print("  提示：把上面 JSON 文件内容直接粘进 WorkBuddy 自动化即可创建；")
+        print("        或按上面逐条在 WorkBuddy「自动化」里手动创建（名称 / 时间 / 指令照抄）。")
+    else:
+        print("  ℹ️ 你选择了「其他方式」，未生成领取相关自动化。")
+        print("     请稍后自行在 WorkBuddy「自动化」里补充领取任务。")
+        print("     派发命令参考：python \"%s\" start-only" % abs_script)
+        if cfg["claim_mode"] == "same-day":
+            print("     领取命令参考：python \"%s\" claim-only" % abs_script)
+        else:
+            print("     每日任务参考：python \"%s\" daily" % abs_script)
+
+
+def _reminder_cmd(message):
+    """返回一个可在系统定时任务中使用的提醒命令。
+
+    Windows 用 PowerShell 弹窗；macOS 用 osascript 通知；Linux 优先 notify-send，
+    不可用则写入缓存目录的 reminder.log。如系统通知不可用，至少保证有文本记录。
+    """
+    if os.name == "nt":
+        return ('powershell -Command "Add-Type -AssemblyName System.Windows.Forms; '
+                '[System.Windows.Forms.MessageBox]::Show(\'%s\', \'猫猫旅行提醒\')"' % message)
+    elif sys.platform == "darwin":
+        return 'osascript -e \'display notification "%s" with title "猫猫旅行提醒"\'' % message
+    else:
+        log_path = os.path.join(os.path.expanduser("~"), ".workbuddy", "cache", "cat-travel", "reminder.log")
+        return ('(command -v notify-send >/dev/null 2>&1 && notify-send "猫猫旅行提醒" "%s") || '
+                'echo "[%s] %s" >> "%s"' % (message, "$(date +%%Y-%%m-%%d\\ %%H:%%M:%%S)", message, log_path))
 
 
 def _win_create_tasks(cfg):
@@ -1069,6 +1206,7 @@ def _win_create_tasks(cfg):
     script = os.path.abspath(__file__)
     cmdline = subprocess.list2cmdline([py, script])
     hh = cfg["trigger_hh"]; mm = cfg["trigger_mm"]
+    claim_method = cfg.get("scheduled_claim_method", "auto")
     ok = True
     if cfg["claim_mode"] == "same-day":
         start_time = "%02d:%02d" % (hh, mm)
@@ -1077,9 +1215,17 @@ def _win_create_tasks(cfg):
         cm = total % 60
         claim_time = "%02d:%02d" % (ch, cm)
         ok &= _win_make("CatTravel-Start", start_time, cmdline + " start-only")
-        ok &= _win_make("CatTravel-Claim", claim_time, cmdline + " claim-only")
+        if claim_method == "remind":
+            ok &= _win_make("CatTravel-ClaimReminder", claim_time,
+                            _reminder_cmd("猫猫旅行已到达，请手动运行 claim-only 领取积分"))
+        elif claim_method != "other":
+            ok &= _win_make("CatTravel-Claim", claim_time, cmdline + " claim-only")
     else:
-        ok &= _win_make("CatTravel-Daily", "%02d:%02d" % (hh, mm), cmdline + " daily")
+        if claim_method == "remind":
+            ok &= _win_make("CatTravel-DailyReminder", "%02d:%02d" % (hh, mm),
+                            _reminder_cmd("请手动运行 daily 领取昨日积分并派发今日旅行"))
+        elif claim_method != "other":
+            ok &= _win_make("CatTravel-Daily", "%02d:%02d" % (hh, mm), cmdline + " daily")
     return ok
 
 
@@ -1109,15 +1255,26 @@ def _nix_create_tasks(cfg):
     else:
         quoted = "%s %s" % (py, script)
     hh = cfg["trigger_hh"]; mm = cfg["trigger_mm"]
+    claim_method = cfg.get("scheduled_claim_method", "auto")
     if cfg["claim_mode"] == "same-day":
         start_line = "%d %d * * * %s start-only" % (mm, hh, quoted)
         total = hh * 60 + mm + int(CONFIG["travel_max_hours"]) * 60 + int(CONFIG["claim_buffer_seconds"] // 60)
         ch = (total // 60) % 24
         cm = total % 60
-        claim_line = "%d %d * * * %s claim-only" % (cm, ch, quoted)
-        lines = [start_line, claim_line]
+        if claim_method == "remind":
+            claim_line = "%d %d * * * %s" % (cm, ch, _reminder_cmd("猫猫旅行已到达，请手动运行 claim-only 领取积分"))
+        elif claim_method == "other":
+            claim_line = None
+        else:
+            claim_line = "%d %d * * * %s claim-only" % (cm, ch, quoted)
+        lines = [start_line] + ([claim_line] if claim_line else [])
     else:
-        lines = ["%d %d * * * %s daily" % (mm, hh, quoted)]
+        if claim_method == "remind":
+            lines = ["%d %d * * * %s" % (mm, hh, _reminder_cmd("请手动运行 daily 领取昨日积分并派发今日旅行"))]
+        elif claim_method == "other":
+            lines = []
+        else:
+            lines = ["%d %d * * * %s daily" % (mm, hh, quoted)]
 
     try:
         existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout.splitlines()
@@ -1141,18 +1298,29 @@ def _nix_create_tasks(cfg):
 def _print_manual_schedule_hint(cfg):
     """打印手动创建定时任务的参考命令（当自动创建失败时使用）。"""
     hh = cfg["trigger_hh"]; mm = cfg["trigger_mm"]
+    claim_method = cfg.get("scheduled_claim_method", "auto")
     print("")
     print("手动创建参考（时间 %02d:%02d）：" % (hh, mm))
     if cfg["claim_mode"] == "same-day":
         total = hh * 60 + mm + int(CONFIG["travel_max_hours"]) * 60 + int(CONFIG["claim_buffer_seconds"] // 60)
         ch = (total // 60) % 24
         cm = total % 60
-        print("  当天领取 需 2 个任务：")
+        print("  当天领取 需至少 1 个任务：")
         print("    · 旅行任务   %02d:%02d  →  python scripts/cat_travel.py start-only" % (hh, mm))
-        print("    · 领取任务   %02d:%02d  →  python scripts/cat_travel.py claim-only" % (ch, cm))
+        if claim_method == "auto":
+            print("    · 领取任务   %02d:%02d  →  python scripts/cat_travel.py claim-only" % (ch, cm))
+        elif claim_method == "remind":
+            print("    · 领取提醒   %02d:%02d  →  请手动运行 python scripts/cat_travel.py claim-only" % (ch, cm))
+        else:
+            print("    · 领取任务：你选择了「其他方式」，请自行补充领取命令。")
     else:
-        print("  隔天领取 需 1 个任务：")
-        print("    · 每日任务   %02d:%02d  →  python scripts/cat_travel.py daily" % (hh, mm))
+        print("  隔天领取：")
+        if claim_method == "auto":
+            print("    · 每日任务   %02d:%02d  →  python scripts/cat_travel.py daily" % (hh, mm))
+        elif claim_method == "remind":
+            print("    · 每日提醒   %02d:%02d  →  请手动运行 python scripts/cat_travel.py daily" % (hh, mm))
+        else:
+            print("    · 每日任务：你选择了「其他方式」，请自行补充 daily 命令。")
 
 
 def main():
