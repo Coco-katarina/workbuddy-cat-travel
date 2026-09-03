@@ -6,24 +6,26 @@ WorkBuddy 成长计划 · 派猫猫旅行自动化
 流程：
   1. 提取本机 WorkBuddy 登录态（decrypt-token.js）
   2. 调用「派猫猫旅行」接口触发旅行
-  3. 出发后按「旅行时长 + 15min 缓冲」自动触发领取（旅行时长优先取 depart/status 响应的 arrive_at-depart_at，无则取 duration_hours）
+  3. 旅行结束（到达）后，按所选模式领取积分：
+     - 当天领取：旅行最长 4 小时 + 额外 15 分钟缓冲，拆成两个定时任务
+       （旅行任务 + 缓冲后领取任务）
+     - 隔天领取：每天先领取「昨日」积分，再开始「当日」旅行；
+       首次运行因无昨日积分会导致领取失败，已做优雅处理，后续正常运行
   4. 调用「领取积分」接口完成领奖
 
 使用方式：
-  python cat_travel.py run          # 完整流程：触发旅行 → 等待 → 领取
+  python cat_travel.py setup        # 交互式安装：选运行方式（手动/定时）+ 领取模式
+  python cat_travel.py run          # 单次手动完整流程：触发旅行 → 等待 → 领取
   python cat_travel.py start-only   # 只触发旅行，不等待（配合定时任务拆分）
-  python cat_travel.py claim-only   # 只执行领取（用于电脑重启后补领）
-  python cat_travel.py status       # 查看当前旅行状态
+  python cat_travel.py claim-only   # 只执行领取（用于电脑重启后补领 / 当天模式）
+  python cat_travel.py daily         # 隔天模式每日任务：先领昨日积分，再开始今日旅行
+  python cat_travel.py status        # 查看当前旅行状态与已选配置
 
-定时任务建议：
-  - 方式 A：用 Windows 任务计划程序 / automation 每天固定时间运行：
-      python cat_travel.py run
-    脚本按「出发 + 旅行时长 + 15min 缓冲」自动等待到触发点再领取，需保持电脑开机至触发点。
-  - 方式 B（适合 WorkBuddy automation，不能长时 sleep）：拆成两个 automation / 计划任务：
-    · 每天 09:00 运行 python cat_travel.py start-only（触发并记下旅行时长 / 触发时间）
-    · 每天固定或更晚运行 python cat_travel.py claim-only
-      claim-only 会用状态文件里的「旅行时长 + 15min」自行判断是否到点，
-      未到点则自动等待，到点则立即领取，无需硬编码固定间隔。
+安装交互说明：
+  其他用户下载安装本 skill 后，运行 `python cat_travel.py setup` 即可按提示选择：
+    ① 运行方式：单次手动执行 / 配置为自动定时任务
+    ② 若选定时：积分领取模式 = 当天领取 / 隔天领取，以及每日触发时间
+  脚本会自动创建系统计划任务（Windows 任务计划 / macOS·Linux crontab）。
 
 接口配置：
   请在下方 CONFIG 区域填入实际接口路径、方法和请求体。
@@ -77,12 +79,18 @@ CONFIG = {
     "claim_delay_after_start_seconds": 4 * 3600 + 30 * 60,  # 兜底上限（仅当取不到任何旅行时长时使用 4.5h）
     "claim_buffer_seconds": 15 * 60,                        # 缓冲：旅行时长基础上额外叠加 15 分钟
 
+    # 当天领取模式的最长旅行时长（用于"旅行任务 + 缓冲后领取任务"的固定偏移计算）
+    "travel_max_hours": 4,
+
     # 重试策略
     "max_retries": 3,
     "retry_delay_seconds": 5,
 
-    # 状态文件（用于崩溃恢复 / claim-only）：写入用户级缓存目录，避免污染 skill 目录
+    # 状态文件（用于崩溃恢复 / claim-only / daily）：写入用户级缓存目录，避免污染 skill 目录
     "state_file": os.path.join(os.path.expanduser("~"), ".workbuddy", "cache", "cat-travel", "cat_travel_state.json"),
+
+    # 配置文件（记录用户选的运行方式 / 领取模式 / 触发时间）：同样写缓存目录，不进 skill 仓库
+    "config_file": os.path.join(os.path.expanduser("~"), ".workbuddy", "cache", "cat-travel", "cat_travel_config.json"),
 
     # 日志文件
     "log_file": os.path.join(os.path.expanduser("~"), ".workbuddy", "cache", "cat-travel", "cat_travel.log"),
@@ -334,7 +342,7 @@ def api_call(path, method="POST", body=None, max_retries=None):
 
 
 # ============================================================
-# 状态持久化
+# 状态持久化（统一用 current_travel 结构）
 # ============================================================
 def load_state():
     try:
@@ -345,8 +353,47 @@ def load_state():
 
 
 def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(CONFIG["state_file"]), exist_ok=True)
+    except Exception:
+        pass
     with open(CONFIG["state_file"], "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def _date_of(iso):
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso).date()
+    except Exception:
+        return None
+
+
+# ============================================================
+# 配置文件（记录用户选的运行方式 / 领取模式 / 触发时间）
+# ============================================================
+def load_config():
+    try:
+        with open(CONFIG["config_file"], "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    cfg.setdefault("run_mode", None)       # manual / scheduled
+    cfg.setdefault("claim_mode", None)     # same-day / next-day
+    cfg.setdefault("schedule_backend", "system")  # system / workbuddy
+    cfg.setdefault("trigger_hh", 9)
+    cfg.setdefault("trigger_mm", 0)
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG["config_file"]), exist_ok=True)
+    except Exception:
+        pass
+    with open(CONFIG["config_file"], "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
 # ============================================================
@@ -448,20 +495,29 @@ def resolve_claim_schedule(data, started_local=None):
     return claim_at, travel_dur, "兜底：固定 %.1f 小时（未读到旅行时长）" % (travel_dur / 3600.0)
 
 
-def persist_travel_schedule(state, data, started_local=None):
-    """把本次旅行的时长 / 触发时间写入状态文件，供 claim-only / 崩溃恢复复用。"""
-    claim_at, travel_dur, src = resolve_claim_schedule(data, started_local)
-    state["depart_at"] = data.get("depart_at")
-    state["arrive_at"] = data.get("arrive_at")
-    state["travel_duration_seconds"] = travel_dur
-    state["claim_at"] = claim_at.isoformat()
-    state["claim_schedule_source"] = src
-    loc = data.get("location", {}) or {}
-    state["location_id"] = loc.get("id") if isinstance(loc, dict) else None
-    state["location_name"] = loc.get("name") if isinstance(loc, dict) else None
-    state["reward_credit"] = data.get("reward_credit", 0)
+def _begin_travel(state):
+    """触发一次新旅行，并把本次旅行的时长 / 触发时间写入 state['current_travel']。
+    返回更新后的 current_travel 字典。"""
+    result = start_travel()
+    resp_data = (result.get("response") or {}).get("data", {})
+    started_local = datetime.now()
+    claim_at, travel_dur, src = resolve_claim_schedule(resp_data, started_local)
+    ct = {
+        "depart_local": started_local.isoformat(),
+        "depart_at": resp_data.get("depart_at"),
+        "arrive_at": resp_data.get("arrive_at"),
+        "location_id": (resp_data.get("location") or {}).get("id") if isinstance(resp_data.get("location"), dict) else None,
+        "location_name": (resp_data.get("location") or {}).get("name") if isinstance(resp_data.get("location"), dict) else None,
+        "record_id": resp_data.get("record_id"),
+        "travel_duration_seconds": travel_dur,
+        "claim_at": claim_at.isoformat(),
+        "claim_schedule_source": src,
+        "claimed": False,
+        "claimed_at": None,
+    }
+    state["current_travel"] = ct
     save_state(state)
-    return claim_at, travel_dur, src
+    return ct
 
 
 # ============================================================
@@ -553,6 +609,12 @@ def _is_already_claimed(resp):
     return False
 
 
+def _is_no_unclaimed_error(e):
+    """判断异常是否来自「无可领旅行」（如网络层 400 但未被 claim_travel 吞掉）。"""
+    s = str(e).lower()
+    return ("no unclaimed" in s) or ("unclaimed travel" in s) or ("已领取" in s) or ("无可领" in s)
+
+
 # ============================================================
 # 主流程
 # ============================================================
@@ -573,144 +635,87 @@ def _fmt_seconds(s):
     return "%d:%02d:%02d" % (s // 3600, (s % 3600) // 60, s % 60)
 
 
+def _need_start_today(state):
+    """判断今天是否还需要触发一次新旅行。
+    返回 True=需要触发；False=今天已触发（无论是否已领）。"""
+    ct = state.get("current_travel") or {}
+    if not ct:
+        return True
+    dep = _date_of(ct.get("depart_local"))
+    today = datetime.now().date()
+    return dep != today
+
+
 def cmd_run():
+    """单次手动完整流程：触发旅行（若今天尚未触发）→ 等待到达+缓冲 → 领取。"""
     ensure_ready()
     state = load_state()
 
-    # 步骤 1：触发旅行（或复用 / 接管已有进行中的旅行）
-    if state.get("travel_started_at") and not state.get("claimed"):
-        # 已有未完成的旅行记录，查询实时状态继续
-        log("发现未完成的旅行记录（%s），查询实时状态继续。" % state["travel_started_at"])
-        try:
-            _, resp = get_travel_status()
-            data = resp.get("data", {}) if isinstance(resp, dict) else {}
-        except Exception:
-            data = (state.get("start_response") or {}).get("data", {})
+    if _need_start_today(state):
+        ct = _begin_travel(state)
+        log("旅行触发成功（%s），预计 %s 到达。" % (
+            ct.get("location_name"), ct["claim_at"]))
     else:
-        try:
-            _, resp = get_travel_status()
-            data = resp.get("data", {}) if isinstance(resp, dict) else {}
-            if data.get("state") == "traveling":
-                log("检测到当前已在旅行中，直接接管状态。")
-                state["travel_started_at"] = datetime.now().isoformat()
-                state["start_response"] = resp
-                state["claimed"] = False
-            else:
-                result = start_travel()
-                state["travel_started_at"] = datetime.now().isoformat()
-                state["start_response"] = result.get("response")
-                state["claimed"] = False
-        except Exception:
-            result = start_travel()
-            state["travel_started_at"] = datetime.now().isoformat()
-            state["start_response"] = result.get("response")
-            state["claimed"] = False
-        data = (state.get("start_response") or {}).get("data", {})
+        ct = state["current_travel"]
+        if ct.get("claimed"):
+            log("今日旅行已完成并领取（%s），无需重复。" % ct.get("claimed_at"))
+            return
+        log("今日旅行已在进行，直接进入等待/领取。")
 
-    # 步骤 2：解析「领取触发时间」= 出发 + 旅行时长 + 缓冲(15min)
-    # 旅行时长数据源见 resolve_claim_schedule（优先 depart/status 的 arrive_at - depart_at）。
-    started_local = None
-    try:
-        started_local = datetime.fromisoformat(state["travel_started_at"])
-    except Exception:
-        pass
-    claim_at, travel_dur, src = persist_travel_schedule(state, data, started_local)
-    log("领取触发计划：旅行时长=%s，缓冲=%dmin，触发时间=%s（来源：%s）" % (
-        _fmt_seconds(travel_dur), CONFIG.get("claim_buffer_seconds", 900) // 60,
-        claim_at.strftime("%Y-%m-%d %H:%M:%S"), src))
-
+    claim_at = datetime.fromisoformat(ct["claim_at"])
     if datetime.now() < claim_at:
         wait_until(claim_at)
     else:
         log("已过触发时间，直接进入领取。")
 
-    # 领取前再查一次 status，顺带刷新 record_id
-    try:
-        _, resp = get_travel_status()
-        data = resp.get("data", {}) if isinstance(resp, dict) else {}
-        record_id = data.get("record_id") or state.get("record_id")
-    except Exception:
-        record_id = state.get("record_id")
-    if record_id:
-        state["record_id"] = record_id
-        save_state(state)
-
-    # 步骤 3：领取
-    claim_result = claim_travel(record_id=record_id)
-    state["claimed"] = True
-    state["claimed_at"] = datetime.now().isoformat()
-    state["claim_response"] = claim_result.get("response")
+    res = claim_travel(record_id=ct.get("record_id"))
+    ct["claimed"] = True
+    ct["claimed_at"] = datetime.now().isoformat()
     save_state(state)
-    log("🎉 派猫猫旅行自动化流程完成。")
+    if res.get("already"):
+        log("🎉 当前无可领旅行（可能已领取），流程结束。")
+    else:
+        log("🎉 派猫猫旅行自动化流程完成。")
 
 
 def cmd_start_only():
+    """只触发旅行（配合定时任务拆分）。若今天已触发则跳过。"""
     ensure_ready()
     state = load_state()
-    if state.get("travel_started_at") and not state.get("claimed"):
-        log("已有进行中的旅行记录，跳过重复触发。")
+    if not _need_start_today(state):
+        ct = state["current_travel"]
+        if ct.get("claimed"):
+            log("今日旅行已完成并领取，无需重复触发。")
+        else:
+            log("今日旅行已触发（%s），无需重复。" % ct.get("depart_local"))
         return
-    # 先查 status，若已在旅行中则直接接管（例如今天已手动派发）
-    try:
-        _, resp = get_travel_status()
-        data = resp.get("data", {}) if isinstance(resp, dict) else {}
-        if data.get("state") == "traveling":
-            log("检测到当前已在旅行中，直接记录状态（record_id=%s）。" % data.get("record_id"))
-            state["travel_started_at"] = datetime.now().isoformat()
-            state["start_response"] = resp
-            state["claimed"] = False
-            claim_at, _, _ = persist_travel_schedule(state, data, datetime.now())
-            log("已记录旅行时长 / 触发时间：%s。" % claim_at.strftime("%Y-%m-%d %H:%M:%S"))
-            return
-    except Exception as e:
-        log("查询 status 失败，尝试直接触发：%s" % e)
-    result = start_travel()
-    state["travel_started_at"] = datetime.now().isoformat()
-    state["start_response"] = result.get("response")
-    state["claimed"] = False
-    data = (result.get("response") or {}).get("data", {})
-    claim_at, _, _ = persist_travel_schedule(state, data, datetime.now())
-    log("旅行触发成功，将在 %s 由 claim-only 自动触发领取。" % claim_at.strftime("%Y-%m-%d %H:%M:%S"))
+    ct = _begin_travel(state)
+    log("旅行触发成功，预计 %s 到达；领取任务将按「到达 + 15min 缓冲」自动触发。" % ct["claim_at"])
 
 
 def cmd_claim_only():
+    """只执行领取（当天模式 / 手动补领）。未到触发时间会自动等待。"""
     ensure_ready()
     state = load_state()
-    record_id = state.get("record_id")
-    if not state.get("travel_started_at"):
-        log("状态文件中没有旅行记录，将直接调用领取接口（record_id=%s）。" % record_id)
+    ct = state.get("current_travel") or {}
 
-    # 解析触发计划：优先用状态文件里的 depart_at/arrive_at，否则查实时 status
-    data = {}
-    try:
-        _, resp = get_travel_status()
-        data = resp.get("data", {}) if isinstance(resp, dict) else {}
-    except Exception:
-        pass
-    merged = dict(data)
-    if state.get("depart_at"):
-        merged["depart_at"] = state["depart_at"]
-    if state.get("arrive_at"):
-        merged["arrive_at"] = state["arrive_at"]
-    if state.get("start_response"):
-        sd = (state["start_response"] or {}).get("data", {})
-        if sd.get("depart_at") and not merged.get("depart_at"):
-            merged["depart_at"] = sd["depart_at"]
-        if sd.get("arrive_at") and not merged.get("arrive_at"):
-            merged["arrive_at"] = sd["arrive_at"]
+    if not ct:
+        log("状态文件中没有旅行记录，尝试直接调用领取接口（手动/补领场景）。")
+        try:
+            res = claim_travel()
+            if res.get("already"):
+                log("当前无可领旅行（可能已领取）。")
+            else:
+                log("🎉 积分领取完成。")
+        except Exception as e:
+            log("❌ 直接领取失败：%s" % e)
+        return
 
-    started_local = None
-    try:
-        started_local = datetime.fromisoformat(state["travel_started_at"])
-    except Exception:
-        pass
+    if ct.get("claimed"):
+        log("当前旅行已领取（%s），无需重复。" % ct.get("claimed_at"))
+        return
 
-    claim_at, travel_dur, src = resolve_claim_schedule(merged, started_local)
-    log("领取触发计划：旅行时长=%s，缓冲=%dmin，触发时间=%s（来源：%s）" % (
-        _fmt_seconds(travel_dur), CONFIG.get("claim_buffer_seconds", 900) // 60,
-        claim_at.strftime("%Y-%m-%d %H:%M:%S"), src))
-
-    # 触发判断：实际经过时间 < 旅行时长 + 缓冲 → 自动等待；否则领取
+    claim_at = datetime.fromisoformat(ct["claim_at"])
     now = datetime.now()
     if now < claim_at:
         remaining = (claim_at - now).total_seconds()
@@ -720,15 +725,84 @@ def cmd_claim_only():
     else:
         log("已过触发时间（实际经过 >= 旅行时长 + 缓冲），直接进入领取。")
 
-    claim_result = claim_travel(record_id=record_id)
-    state["claimed"] = True
-    state["claimed_at"] = datetime.now().isoformat()
-    state["claim_response"] = claim_result.get("response")
+    try:
+        res = claim_travel(record_id=ct.get("record_id"))
+    except Exception as e:
+        if _is_no_unclaimed_error(e):
+            log("无未领取的旅行（可能已手动领取），标记完成。")
+            ct["claimed"] = True
+            ct["claimed_at"] = datetime.now().isoformat()
+            save_state(state)
+        else:
+            log("❌ 积分领取失败：%s" % e)
+        return
+    ct["claimed"] = True
+    ct["claimed_at"] = datetime.now().isoformat()
     save_state(state)
-    log("🎉 积分领取完成。")
+    if res.get("already"):
+        log("🎉 当前无可领旅行（可能已领取）。")
+    else:
+        log("🎉 积分领取完成。")
+
+
+def cmd_daily():
+    """隔天领取模式每日任务：先领取「昨日」积分，再开始「当日」旅行。
+    首次运行：状态文件为空 → 无昨日积分可领（领取步骤被安全跳过），直接进入「开始今日旅行」，
+    不会因『无昨日积分』而报错退出，后续每天均可正常运行。
+    """
+    ensure_ready()
+    state = load_state()
+    today = datetime.now().date()
+    ct = state.get("current_travel") or {}
+
+    # ---------- 步骤 1：领取昨日（或更早未领）的积分 ----------
+    if ct and not ct.get("claimed"):
+        dep = _date_of(ct.get("depart_local"))
+        if dep and dep < today:
+            log("检测到 %s 的旅行尚未领取，先领取昨日积分..." % dep)
+            try:
+                res = claim_travel(record_id=ct.get("record_id"))
+                ct["claimed"] = True
+                ct["claimed_at"] = datetime.now().isoformat()
+                save_state(state)
+                if res.get("already"):
+                    log("昨日无可领积分（可能已领），标记完成。")
+                else:
+                    log("✅ 昨日积分领取成功。")
+            except Exception as e:
+                if _is_no_unclaimed_error(e):
+                    # 服务端判定无未领旅行（含首次运行兜底），标记完成，避免无限重试
+                    log("无未领取的旅行（首次运行或已领），标记完成，继续今日旅行。")
+                    ct["claimed"] = True
+                    ct["claimed_at"] = datetime.now().isoformat()
+                    save_state(state)
+                else:
+                    log("⚠️ 昨日积分领取失败：%s（不影响今日旅行，明日再试）" % e)
+        elif dep == today:
+            log("今日旅行仍在进行，明日再领取，跳过领取步骤。")
+        else:
+            log("历史旅行记录无需处理。")
+    else:
+        log("无历史旅行记录（首次运行），无需领取昨日积分。")
+
+    # ---------- 步骤 2：开始今日旅行 ----------
+    ct2 = state.get("current_travel") or {}
+    if not _need_start_today(state):
+        log("今日旅行已触发（%s），无需重复。" % ct2.get("depart_local"))
+        return
+    new_ct = _begin_travel(state)
+    log("今日旅行已触发（%s），预计 %s 到达；明日由 daily 任务自动领取昨日积分。" % (
+        new_ct.get("location_name"), new_ct["claim_at"]))
 
 
 def cmd_status():
+    cfg = load_config()
+    log("--- 已选配置 ---")
+    log("运行方式：%s" % ("手动" if cfg.get("run_mode") == "manual" else ("自动定时" if cfg.get("run_mode") == "scheduled" else "未配置（请运行 setup）")))
+    if cfg.get("run_mode") == "scheduled":
+        log("领取模式：%s" % ("当天领取" if cfg.get("claim_mode") == "same-day" else "隔天领取"))
+        log("触发时间：%02d:%02d" % (cfg.get("trigger_hh", 9), cfg.get("trigger_mm", 0)))
+
     has_token = True
     try:
         extract_token()
@@ -736,11 +810,16 @@ def cmd_status():
         has_token = False
         log("提取登录态失败：%s（仅显示本地状态）" % e)
     state = load_state()
-    if state:
-        log("本地记录 - 旅行启动：%s，已领奖：%s，record_id：%s" % (
-            state.get("travel_started_at", "无"),
-            "是" if state.get("claimed") else "否",
-            state.get("record_id", "无")))
+    ct = state.get("current_travel") or {}
+    if ct:
+        log("--- 本地旅行记录 ---")
+        log("出发时间：%s，目的地：%s" % (ct.get("depart_local", "无"), ct.get("location_name", "无")))
+        log("已领奖：%s" % ("是" if ct.get("claimed") else "否"))
+        if ct.get("claimed_at"):
+            log("领取时间：%s" % ct.get("claimed_at"))
+        log("领取触发时间：%s" % ct.get("claim_at", "无"))
+    else:
+        log("本地暂无旅行记录。")
     if not has_token:
         return
     # 已登录但成长计划未开通 → 自动打开浏览器引导开通
@@ -767,8 +846,323 @@ def cmd_status():
         log("查询实时状态失败：%s" % e)
 
 
+# ============================================================
+# 安装交互（setup）：选择运行方式 + 领取模式，并创建系统定时任务
+# ============================================================
+def _parse_time(s):
+    s = (s or "").strip()
+    if ":" not in s:
+        raise ValueError("时间格式应为 HH:MM，例如 09:00")
+    hh, mm = s.split(":", 1)
+    hh = int(hh); mm = int(mm)
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ValueError("小时 0-23，分钟 0-59")
+    return hh, mm
+
+
+def _prompt_choice(prompt, choices, default_key=None):
+    """交互式单选。choices = [(key, desc), ...]。非交互（无 TTY）时回退到 default_key。"""
+    print("")
+    print(prompt)
+    for k, d in choices:
+        mark = " (默认)" if k == default_key else ""
+        print("  %s) %s%s" % (k, d, mark))
+    if not sys.stdin.isatty():
+        print("  （当前为非交互环境，使用默认：%s）" % default_key)
+        return default_key
+    while True:
+        inp = input("请选择 [%s]: " % (default_key or "")).strip()
+        if not inp and default_key:
+            return default_key
+        if inp in [k for k, _ in choices]:
+            return inp
+        print("  输入无效，请重新选择。")
+
+
+def cmd_setup():
+    print("=" * 60)
+    print("  派猫猫旅行 · 安装向导")
+    print("=" * 60)
+    print("本向导帮你一步步选择运行方式，并（可选）创建定时任务。")
+    print("随时可重跑本向导修改配置；配置保存在用户缓存目录，不写入 skill 仓库。")
+    print("")
+    print("💡 建议：先选「单次手动执行」跑通一次、确认能领到积分后，")
+    print("   再回来重跑本向导配置定时任务，体验更稳、心里更踏实。")
+
+    cfg = load_config()
+
+    # ---------- ① 运行方式 ----------
+    run_mode = os.environ.get("CAT_TRAVEL_RUN_MODE")
+    if run_mode not in ("manual", "scheduled"):
+        k = _prompt_choice(
+            "① 你希望如何运行猫猫旅行？",
+            [("1", "单次手动执行（推荐先试：随时自己运行，不创建定时任务）"),
+             ("2", "配置为自动定时任务（每天自动跑，需要继续选领取模式 / 载体 / 时间）")],
+            default_key="1")
+        run_mode = {"1": "manual", "2": "scheduled"}.get(k, "manual")
+    cfg["run_mode"] = run_mode
+
+    # ---------- ② 积分领取模式（手动 / 定时都要知道，run / daily 用得到） ----------
+    claim_mode = os.environ.get("CAT_TRAVEL_CLAIM_MODE")
+    if claim_mode not in ("same-day", "next-day"):
+        k = _prompt_choice(
+            "② 积分领取模式？",
+            [("1", "当天领取：一次 run 完成「派发 + 等待 + 领积分」（最长 4h+15min 缓冲）"),
+             ("2", "隔天领取：用 daily，每天先领「昨日」积分再派「当日」旅行（首次无昨日会自动跳过）")],
+            default_key="1")
+        claim_mode = {"1": "same-day", "2": "next-day"}.get(k, "same-day")
+    cfg["claim_mode"] = claim_mode
+
+    if run_mode == "manual":
+        save_config(cfg)
+        print("")
+        print("✅ 已保存为「手动模式」。之后你可以随时运行：")
+        if claim_mode == "same-day":
+            print("     python scripts/cat_travel.py run        # 一次完成 派发+等待+领积分")
+            print("  或拆成两步：")
+            print("     python scripts/cat_travel.py start-only  # 先派发")
+            print("     python scripts/cat_travel.py claim-only  # 到了再领")
+        else:
+            print("     python scripts/cat_travel.py daily       # 先领昨日积分，再派今日旅行")
+        print("（想改成自动定时，重跑 `python scripts/cat_travel.py setup` 即可。）")
+        return
+
+    # ---------- ③ 定时任务载体 ----------
+    backend = os.environ.get("CAT_TRAVEL_SCHEDULE_BACKEND")
+    if backend not in ("system", "workbuddy"):
+        k = _prompt_choice(
+            "③ 定时任务由谁负责调度？",
+            [("1", "系统计划任务（Windows 任务计划 / macOS·Linux crontab）——脚本直接创建，电脑睡眠也能跑，更稳"),
+             ("2", "WorkBuddy 定时自动化——生成配置后你在 WorkBuddy 里点一下创建；依赖 WorkBuddy 在触发时刻运行（睡眠不跑）")],
+            default_key="1")
+        backend = {"1": "system", "2": "workbuddy"}.get(k, "system")
+    cfg["schedule_backend"] = backend
+
+    # ---------- ④ 触发时间（用户自己定） ----------
+    trigger = os.environ.get("CAT_TRAVEL_TRIGGER")
+    if not trigger and sys.stdin.isatty():
+        print("")
+        print("④ 每日触发时间：你常几点开机 / 在线就填几点（例如常 9 点开电脑填 09:00）。")
+        print("   时间完全由你定，没有强制要求；下面只是默认值建议。")
+    if not trigger:
+        if sys.stdin.isatty():
+            trigger = input("   触发时间（HH:MM，默认 09:00）：").strip()
+    if not trigger:
+        trigger = "09:00"
+    try:
+        hh, mm = _parse_time(trigger)
+    except Exception as e:
+        print("时间格式有误（%s），改用默认 09:00。" % e)
+        hh, mm = 9, 0
+    cfg["trigger_hh"] = hh
+    cfg["trigger_mm"] = mm
+    save_config(cfg)
+
+    # ---------- ⑤ 执行 ----------
+    print("")
+    if backend == "system":
+        print("正在创建系统定时任务（%s / 触发时间 %02d:%02d）..." % (
+            "当天领取" if claim_mode == "same-day" else "隔天领取", hh, mm))
+        ok = create_scheduled_tasks(cfg)
+        print("")
+        if ok:
+            print("✅ 系统定时任务已创建。配置已保存到：")
+            print("   %s" % CONFIG["config_file"])
+        else:
+            print("⚠️ 自动创建未完全成功（可能缺少权限或非桌面环境）。")
+            print("   你可手动按下面的命令创建；或把报错反馈给作者。")
+        _print_manual_schedule_hint(cfg)
+    else:
+        print("正在生成 WorkBuddy 定时自动化配置（%s / 触发时间 %02d:%02d）..." % (
+            "当天领取" if claim_mode == "same-day" else "隔天领取", hh, mm))
+        _emit_workbuddy_automation(cfg)
+        print("")
+        print("✅ WorkBuddy 自动化配置已生成。配置已保存到：")
+        print("   %s" % CONFIG["config_file"])
+
+    print("")
+    print("💡 最后建议：先手动跑一次确认能领到积分，再放心依赖定时任务。")
+    if claim_mode == "same-day":
+        print("     python scripts/cat_travel.py run")
+    else:
+        print("     python scripts/cat_travel.py daily")
+
+
+def create_scheduled_tasks(cfg):
+    """按配置创建系统定时任务。成功返回 True，任一失败返回 False。"""
+    if cfg.get("schedule_backend") == "workbuddy":
+        # WorkBuddy 载体不在这里建系统任务，由 _emit_workbuddy_automation 处理
+        return False
+    if os.name == "nt":
+        return _win_create_tasks(cfg)
+    return _nix_create_tasks(cfg)
+
+
+def _emit_workbuddy_automation(cfg):
+    """生成 WorkBuddy 定时自动化配置（JSON 文件 + 控制台指引）。
+
+    说明：脚本运行在普通 Python 环境，无法直接创建 WorkBuddy 自动化，
+    因此输出一份可直接粘贴 / 逐条创建的配置，由用户在 WorkBuddy 内完成创建。
+    """
+    hh = cfg["trigger_hh"]; mm = cfg["trigger_mm"]
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    abs_script = os.path.join(script_dir, "cat_travel.py")
+
+    def rrule(h, m):
+        return "FREQ=DAILY;BYHOUR=%d;BYMINUTE=%d" % (h, m)
+
+    def make(name, h, m, prompt):
+        return {
+            "name": name,
+            "start_hh": h,
+            "start_mm": m,
+            "scheduleType": "recurring",
+            "rrule": rrule(h, m),
+            "cwds": [script_dir],
+            "status": "ACTIVE",
+            "prompt": prompt,
+        }
+
+    if cfg["claim_mode"] == "same-day":
+        total = hh * 60 + mm + int(CONFIG["travel_max_hours"]) * 60 + int(CONFIG["claim_buffer_seconds"] // 60)
+        ch = (total // 60) % 24
+        cm = total % 60
+        autos = [
+            make("派猫猫旅行-触发@%02d:%02d" % (hh, mm), hh, mm,
+                 "运行 `python \"%s\" start-only` 派发猫猫旅行并写入到达时间。若提示未开通成长计划，则打开浏览器引导开通；完成后汇报：派发成功 / 已在进行中无需重复 / 令牌失效需刷新登录。" % abs_script),
+            make("派猫猫旅行-领奖@%02d:%02d" % (ch, cm), ch, cm,
+                 "运行 `python \"%s\" claim-only` 按旅行时长自动判断到点后领取积分（幂等）。汇报：领取成功得几分 / 无可领（今日已领或还没派发） / 令牌失效需刷新登录。" % abs_script),
+        ]
+    else:
+        autos = [
+            make("派猫猫旅行-每日@%02d:%02d" % (hh, mm), hh, mm,
+                 "运行 `python \"%s\" daily`：先领昨日积分（无昨日则安全跳过），再派发今日旅行。首次运行无昨日积分属正常。汇报：领取结果 / 已派发 / 令牌失效需刷新登录。" % abs_script),
+        ]
+
+    out = os.path.join(script_dir, "workbuddy_automation_config.json")
+    try:
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(autos, f, ensure_ascii=False, indent=2)
+        log("WorkBuddy 自动化配置已生成：%s" % out)
+    except Exception as e:
+        log("写入 WB 配置失败：%s" % e)
+
+    print("  ✅ 配置已写入：%s" % out)
+    print("")
+    print("  在 WorkBuddy 中创建自动化的方法（逐条创建）：")
+    for a in autos:
+        print("   · 名称：%s" % a["name"])
+        print("     时间：每天 %02d:%02d（rrule: %s）" % (a["start_hh"], a["start_mm"], a["rrule"]))
+        print("     指令：%s" % a["prompt"])
+        print("")
+    print("  提示：把上面 JSON 文件内容直接粘进 WorkBuddy 自动化即可创建；")
+    print("        或按上面逐条在 WorkBuddy「自动化」里手动创建（名称 / 时间 / 指令照抄）。")
+
+
+def _win_create_tasks(cfg):
+    """Windows：用 schtasks 创建。先清理旧的 CatTravel-* 任务避免残留。"""
+    names = ["CatTravel-Start", "CatTravel-Claim", "CatTravel-Daily", "CatTravelDaily"]
+    for n in names:
+        subprocess.run(["schtasks", "/Delete", "/TN", n, "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    py = sys.executable
+    script = os.path.abspath(__file__)
+    cmdline = subprocess.list2cmdline([py, script])
+    hh = cfg["trigger_hh"]; mm = cfg["trigger_mm"]
+    ok = True
+    if cfg["claim_mode"] == "same-day":
+        start_time = "%02d:%02d" % (hh, mm)
+        total = hh * 60 + mm + int(CONFIG["travel_max_hours"]) * 60 + int(CONFIG["claim_buffer_seconds"] // 60)
+        ch = (total // 60) % 24
+        cm = total % 60
+        claim_time = "%02d:%02d" % (ch, cm)
+        ok &= _win_make("CatTravel-Start", start_time, cmdline + " start-only")
+        ok &= _win_make("CatTravel-Claim", claim_time, cmdline + " claim-only")
+    else:
+        ok &= _win_make("CatTravel-Daily", "%02d:%02d" % (hh, mm), cmdline + " daily")
+    return ok
+
+
+def _win_make(name, t, cmdline):
+    r = subprocess.run(["schtasks", "/Create", "/TN", name, "/TR", cmdline,
+                        "/SC", "DAILY", "/ST", t, "/F"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        log("计划任务已创建：%s（%s）" % (name, t))
+        print("  ✅ %s  @ %s" % (name, t))
+        return True
+    log("计划任务创建失败：%s -> %s" % (name, (r.stderr or r.stdout or "").strip()[:200]))
+    print("  ❌ %s 创建失败：%s" % (name, (r.stderr or r.stdout or "").strip()[:160]))
+    return False
+
+
+def _nix_create_tasks(cfg):
+    """macOS / Linux：用 crontab 创建（先移除旧 cat-travel 区块避免重复）。"""
+    try:
+        import shlex
+    except Exception:
+        shlex = None
+    py = sys.executable
+    script = os.path.abspath(__file__)
+    if shlex:
+        quoted = "%s %s" % (shlex.quote(py), shlex.quote(script))
+    else:
+        quoted = "%s %s" % (py, script)
+    hh = cfg["trigger_hh"]; mm = cfg["trigger_mm"]
+    if cfg["claim_mode"] == "same-day":
+        start_line = "%d %d * * * %s start-only" % (mm, hh, quoted)
+        total = hh * 60 + mm + int(CONFIG["travel_max_hours"]) * 60 + int(CONFIG["claim_buffer_seconds"] // 60)
+        ch = (total // 60) % 24
+        cm = total % 60
+        claim_line = "%d %d * * * %s claim-only" % (cm, ch, quoted)
+        lines = [start_line, claim_line]
+    else:
+        lines = ["%d %d * * * %s daily" % (mm, hh, quoted)]
+
+    try:
+        existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout.splitlines()
+    except Exception:
+        existing = []
+    filtered = [l for l in existing if "cat-travel" not in l and "CatTravel" not in l]
+    block = ["# >>> cat-travel >>>"] + lines + ["# <<< cat-travel <<<"]
+    newlines = filtered + block
+    r = subprocess.run(["crontab", "-"], input="\n".join(newlines) + "\n",
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        for ln in lines:
+            log("crontab 已写入：%s" % ln)
+            print("  ✅ %s" % ln)
+        return True
+    log("crontab 写入失败：%s" % (r.stderr or "").strip()[:200])
+    print("  ❌ crontab 写入失败：%s" % (r.stderr or "").strip()[:160])
+    return False
+
+
+def _print_manual_schedule_hint(cfg):
+    """打印手动创建定时任务的参考命令（当自动创建失败时使用）。"""
+    hh = cfg["trigger_hh"]; mm = cfg["trigger_mm"]
+    print("")
+    print("手动创建参考（时间 %02d:%02d）：" % (hh, mm))
+    if cfg["claim_mode"] == "same-day":
+        total = hh * 60 + mm + int(CONFIG["travel_max_hours"]) * 60 + int(CONFIG["claim_buffer_seconds"] // 60)
+        ch = (total // 60) % 24
+        cm = total % 60
+        print("  当天领取 需 2 个任务：")
+        print("    · 旅行任务   %02d:%02d  →  python scripts/cat_travel.py start-only" % (hh, mm))
+        print("    · 领取任务   %02d:%02d  →  python scripts/cat_travel.py claim-only" % (ch, cm))
+    else:
+        print("  隔天领取 需 1 个任务：")
+        print("    · 每日任务   %02d:%02d  →  python scripts/cat_travel.py daily" % (hh, mm))
+
+
 def main():
-    usage = "用法：python cat_travel.py run | claim-only | status"
+    usage = ("用法：python cat_travel.py <命令>\n"
+             "  setup       交互式安装：选运行方式 + 领取模式，自动建定时任务\n"
+             "  run         单次手动完整流程：触发旅行 → 等待 → 领取\n"
+             "  start-only  只触发旅行（配合定时任务拆分）\n"
+             "  claim-only  只领取（当天模式 / 手动补领，到点自动等待）\n"
+             "  daily       隔天模式每日任务：先领昨日积分再开始今日旅行\n"
+             "  status      查看旅行状态与已选配置")
     if len(sys.argv) < 2:
         print(usage)
         sys.exit(1)
@@ -778,17 +1172,23 @@ def main():
     log("派猫猫旅行自动化启动，命令：%s" % cmd)
 
     try:
-        if cmd in ("run", "start-and-claim"):
+        if cmd in ("setup", "install"):
+            cmd_setup()
+        elif cmd in ("run", "start-and-claim"):
             cmd_run()
         elif cmd in ("start-only", "start"):
             cmd_start_only()
         elif cmd in ("claim-only", "claim"):
             cmd_claim_only()
+        elif cmd in ("daily", "next-day"):
+            cmd_daily()
         elif cmd == "status":
             cmd_status()
         else:
             print(usage)
             sys.exit(1)
+    except SystemExit:
+        raise
     except Exception as e:
         log("❌ 流程异常：%s" % e)
         sys.exit(1)
